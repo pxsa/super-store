@@ -104,7 +104,6 @@ class SalesDataBuilder:
         print(nulls[nulls > 0])
 
     def build(self, verbose: bool = True) -> pd.DataFrame:
-     
         self._load_raw_tables()
         if verbose:
             self._print_raw_quality_report()
@@ -126,10 +125,7 @@ class SalesDataBuilder:
         self.df = df
         return self.df
 
-
-
 class SalesDataCleaner:
-
 
     CATEGORICAL_COLS = ['Segment', 'Category', 'Sub-Category', 'Region',
                         'Market', 'ShipMode', 'OrderPriority']
@@ -185,6 +181,23 @@ class SalesDataCleaner:
         self.df['IsReturned'] = self.df['IsReturned'].apply(lambda x: 'Yes' if x != 'No' else 'No')
         return self
 
+    def engineer_features(self):
+        self.df['shipping_duration'] = (self.df['ShipDate'] - self.df['OrderDate']).dt.days
+        self.df['shipping_cost_pct'] = self.df['Shipping Cost'] / self.df['Sales']
+        self.df['profit_margin'] = self.df['Profit'] / self.df['Sales']
+        self.df['discount_tier'] = pd.cut(
+            self.df['Discount'], bins=[-0.01, 0, 0.2, 0.4, 1],
+            labels=['0%', '0-20%', '20-40%', '40%+']
+        )
+        self.df['is_loss'] = self.df['Profit'] < 0
+
+        print("New columns added: shipping_duration, shipping_cost_pct, profit_margin, discount_tier, is_loss")
+        print(self.df[['shipping_duration', 'shipping_cost_pct', 'profit_margin']].describe())
+        print()
+        print("Mean Profit and order count by discount tier:")
+        print(self.df.groupby('discount_tier', observed=True)['Profit'].agg(['mean', 'count']))
+        return self
+
     def clean(self, verbose: bool = True) -> pd.DataFrame:
         """Runs every cleaning step in the exact order of cells [15]-[24]."""
         self.cast_dates()
@@ -206,9 +219,8 @@ class SalesDataCleaner:
         print("shape :", self.df.shape)
 
 
-
 class EDAVisualizer:
-  
+
     def __init__(self, df: pd.DataFrame):
         self.df = df
         sns.set_style('whitegrid')
@@ -395,23 +407,45 @@ class EDAVisualizer:
         g.fig.suptitle(f'{method.title()} Correlation — Clustered', y=1.02)
         plt.show()
 
+    def plot_joint_distribution(self, x_col, y_col, kind='hex', ylim=None, xlim=None):
+        g = sns.jointplot(data=self.df, x=x_col, y=y_col, kind=kind, height=8)
+        if ylim:
+            g.ax_joint.set_ylim(ylim)
+        if xlim:
+            g.ax_joint.set_xlim(xlim)
+        g.fig.suptitle(f'{x_col} vs {y_col} — Joint Distribution', y=1.02)
+        plt.show()
+
+    def plot_joint_distribution_jittered(self, x_col, y_col, ylim=None, jitter_std=0.005, alpha=0.1):
+        import numpy as np
+        jittered = self.df[x_col] + np.random.normal(0, jitter_std, len(self.df))
+        temp = self.df.copy()
+        temp[f'{x_col}_jittered'] = jittered
+        g = sns.jointplot(data=temp, x=f'{x_col}_jittered', y=y_col, kind='scatter',
+                           height=8, joint_kws={'alpha': alpha, 's': 8})
+        g.ax_joint.set_xlabel(x_col)
+        if ylim:
+            g.ax_joint.set_ylim(ylim)
+        g.fig.suptitle(f'{x_col} vs {y_col} — Joint Distribution (jittered)', y=1.02)
+        plt.show()
+
     def plot_small_multiples_trend_by_region(self, value_col='Sales', date_col='OrderDate'):
 
         import matplotlib.dates as mdates
- 
+
         df = self.df.copy()
         df[date_col] = pd.to_datetime(df[date_col])
         grouped = df.set_index(date_col).groupby('Region').resample('QS')[value_col].sum().reset_index()
- 
+
         g = sns.relplot(data=grouped, x=date_col, y=value_col, col='Region', col_wrap=4,
                          kind='line', height=2.5, facet_kws={'sharey': False})
         g.fig.suptitle(f'Quarterly {value_col} Trend — Small Multiples by Region', y=1.03)
- 
+
         for ax in g.axes.flatten():
             ax.xaxis.set_major_locator(mdates.YearLocator())
             ax.xaxis.set_major_formatter(mdates.DateFormatter('%Y'))
             ax.tick_params(axis='x', rotation=45)
- 
+
         plt.show()
 
     def plot_ridge_profit_by_category(self, clip=(-500, 500)):
@@ -427,7 +461,6 @@ class EDAVisualizer:
         ax.legend()
         plt.tight_layout()
         plt.show()
-
 
 
 class HypothesisTester:
@@ -478,7 +511,6 @@ class HypothesisTester:
               f"({'negligible' if abs(cohens_d) < 0.2 else 'small' if abs(cohens_d) < 0.5 else 'medium' if abs(cohens_d) < 0.8 else 'large'})")
 
         return {"p_ttest": p_ttest, "p_mwu": p_mwu, "cohens_d": cohens_d}
-
 
     def run_hypothesis_profit_by_category(self):
         cats = self.df['Category'].unique()
@@ -543,7 +575,7 @@ class HypothesisTester:
         print(f"\nMinimum expected count in contingency table: {expected.min():.1f}  "
               f"({'Acceptable (>=5)' if expected.min() >= 5 else 'Warning: Less than 5'})")
 
-        print(f"\nChi-Square: X^2={chi2:.4f}, p-value={p_chi:.6f}, dof={dof}")
+        print(f"\nChi-Square: χ²={chi2:.4f}, p-value={p_chi:.6f}, dof={dof}")
 
         n = contingency.sum().sum()
         cramers_v = np.sqrt(chi2 / (n * (min(contingency.shape) - 1)))
@@ -646,6 +678,143 @@ class HypothesisTester:
         print(f"Spearman rho={rho:.4f}, p={p_spearman:.6f}")
         return {"pearson_r": r, "spearman_rho": rho}
 
+
+    def check_vif(self, numeric_cols):
+        import statsmodels.api as sm
+        from statsmodels.stats.outliers_influence import variance_inflation_factor
+
+        X = sm.add_constant(self.df[list(numeric_cols)])
+        vif = pd.DataFrame({
+            'feature': X.columns,
+            'VIF': [variance_inflation_factor(X.values, i) for i in range(X.shape[1])]
+        })
+        print(vif)
+        return vif
+
+    def run_twoway_anova(self, factor1, factor2, value_col, plot=True):
+        import statsmodels.api as sm
+        import statsmodels.formula.api as smf
+
+        if plot:
+            fig, ax = plt.subplots(figsize=(10, 6))
+            sns.pointplot(data=self.df, x=factor1, y=value_col, hue=factor2, errorbar=None, ax=ax)
+            ax.set_title(f'Interaction Plot: {factor1} × {factor2} on {value_col}')
+            plt.tight_layout()
+            plt.show()
+
+        formula = f'{value_col} ~ C({factor1}) + C({factor2}) + C({factor1}):C({factor2})'
+        model = smf.ols(formula, data=self.df).fit()
+        anova_table = sm.stats.anova_lm(model, typ=2)
+        print(anova_table)
+        return anova_table
+
+    def run_manova(self, dependent_vars, factor):
+        from statsmodels.multivariate.manova import MANOVA
+
+        formula = f"{' + '.join(dependent_vars)} ~ C({factor})"
+        maov = MANOVA.from_formula(formula, data=self.df)
+        result = maov.mv_test()
+        print(result)
+        return result
+
+    def run_ancova(self, value_col, factor, covariate):
+        import statsmodels.api as sm
+        import statsmodels.formula.api as smf
+
+        formula = f'{value_col} ~ C({factor}) + {covariate}'
+        model = smf.ols(formula, data=self.df).fit()
+        ancova_table = sm.stats.anova_lm(model, typ=2)
+        print(ancova_table)
+        print()
+        print(model.summary())
+        return ancova_table, model
+
+    def run_mancova(self, dependent_vars, factor, covariate):
+        from statsmodels.multivariate.manova import MANOVA
+
+        formula = f"{' + '.join(dependent_vars)} ~ C({factor}) + {covariate}"
+        maov = MANOVA.from_formula(formula, data=self.df)
+        result = maov.mv_test()
+        print(result)
+        return result
+
+    def run_hypothesis_discount_tier_vs_loss(self):
+        contingency = pd.crosstab(self.df['discount_tier'], self.df['is_loss'])
+        print(contingency)
+        print()
+
+        chi2, p, dof, expected = chi2_contingency(contingency)
+        print(f"Chi-Square: chi2={chi2:.4f}, p={p:.6f}, dof={dof}")
+
+        n = contingency.sum().sum()
+        cramers_v = np.sqrt(chi2 / (n * (min(contingency.shape) - 1)))
+        print(f"Cramér's V: {cramers_v:.4f}")
+
+        loss_rate = self.df.groupby('discount_tier', observed=True)['is_loss'].mean() * 100
+        print("\nLoss rate by discount tier (%):")
+        print(loss_rate.round(1))
+
+        return {"chi2": chi2, "p": p, "cramers_v": cramers_v}
+
+
+class CustomerAnalyzer:
+
+    def __init__(self, df: pd.DataFrame):
+        self.df = df
+        self.rfm = None
+
+    def build_rfm_table(self, reference_date=None):
+
+        df = self.df
+        if reference_date is None:
+            reference_date = df['OrderDate'].max()
+
+        rfm = df.groupby('CustomerName').agg(
+            frequency=('Order ID', 'nunique'),
+            n_items=('SalesKey', 'count'),
+            monetary=('Sales', 'sum'),
+            total_profit=('Profit', 'sum'),
+            avg_discount=('Discount', 'mean'),
+            return_rate=('IsReturned', lambda x: (x == 'Yes').mean()),
+            last_order=('OrderDate', 'max'),
+            first_order=('OrderDate', 'min'),
+        ).reset_index()
+
+        rfm['recency_days'] = (reference_date - rfm['last_order']).dt.days
+        rfm['tenure_days'] = (rfm['last_order'] - rfm['first_order']).dt.days
+
+        print(f"Number of unique customers: {len(rfm)}")
+        print(rfm[['frequency', 'monetary', 'recency_days', 'total_profit']].describe())
+
+        self.rfm = rfm
+        return rfm
+
+    def cluster_customers(self, n_clusters=4, features=('recency_days', 'frequency', 'monetary')):
+        from sklearn.preprocessing import StandardScaler
+        from sklearn.cluster import KMeans
+
+        assert self.rfm is not None, "Call build_rfm_table() first."
+
+        X = self.rfm[list(features)].copy()
+        X_scaled = StandardScaler().fit_transform(X)
+
+        km = KMeans(n_clusters=n_clusters, random_state=42, n_init=10)
+        self.rfm['segment'] = km.fit_predict(X_scaled)
+
+        print("Average feature values per segment:")
+        print(self.rfm.groupby('segment')[list(features) + ['total_profit']].mean())
+        return self.rfm
+
+    def plot_rfm_segments(self):
+        assert self.rfm is not None and 'segment' in self.rfm.columns, \
+            "Call build_rfm_table() and cluster_customers() first."
+
+        fig, ax = plt.subplots(figsize=(9, 6))
+        sns.scatterplot(data=self.rfm, x='frequency', y='monetary', hue='segment',
+                         palette='viridis', size='recency_days', sizes=(20, 200), ax=ax)
+        ax.set_title('Customer Segments (K-Means on Recency / Frequency / Monetary)')
+        plt.tight_layout()
+        plt.show()
 
 
 class InteractiveEDA:
